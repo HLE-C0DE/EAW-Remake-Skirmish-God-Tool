@@ -6,17 +6,45 @@ import subprocess
 import xml.etree.ElementTree as ET
 import sys
 
+# ============================================================
+# DEBUG MODE: Set to True to see detailed unit conversion logs
+# ============================================================
+DEBUG = False
+
 # Configuration
 # Path to the specific mod folder we are targeting
 # Since script is now in root (32470), we target the subdirectory
-WORKING_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "2794270450")
-BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "2794270450 - Copie")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+MOD_FOLDER_NAME = "2794270450"
+WORKING_DIR = os.path.join(SCRIPT_DIR, MOD_FOLDER_NAME)
 
 # Fallback in case __file__ fails or we want hardcoded absolute assurance
 if not os.path.exists(WORKING_DIR):
     WORKING_DIR = r"G:\SteamLibrary\steamapps\workshop\content\32470\2794270450"
-if not os.path.exists(BACKUP_DIR):
-    BACKUP_DIR = r"G:\SteamLibrary\steamapps\workshop\content\32470\2794270450 - Copie"
+    SCRIPT_DIR = os.path.dirname(WORKING_DIR)
+
+# Dynamically find or create backup directory
+def find_or_create_backup():
+    """Search for existing backup folder (- copy or - copie) or create one."""
+    parent_dir = SCRIPT_DIR
+    
+    # Search for existing backups
+    for item in os.listdir(parent_dir):
+        item_path = os.path.join(parent_dir, item)
+        if os.path.isdir(item_path):
+            # Check if it matches pattern: "2794270450 - copy" or "2794270450 - copie"
+            if item.lower().startswith(MOD_FOLDER_NAME.lower()):
+                if " - copy" in item.lower() or " - copie" in item.lower():
+                    print(f"Found existing backup: {item}")
+                    return item_path
+    
+    # No backup found, create default one
+    backup_name = f"{MOD_FOLDER_NAME} - copy"
+    backup_path = os.path.join(parent_dir, backup_name)
+    print(f"No backup found. Will create: {backup_name}")
+    return backup_path
+
+BACKUP_DIR = find_or_create_backup()
 
 XML_DIR = os.path.join(WORKING_DIR, "Data", "Xml")
 
@@ -35,9 +63,20 @@ def print_header(msg):
 
 def restore_backup():
     print_header("Step 1: Restoring from Clean Backup")
+    print(f"Using backup: {BACKUP_DIR}")
+    
     if not os.path.exists(BACKUP_DIR):
-        print(f"ERROR: Backup directory not found: {BACKUP_DIR}")
-        sys.exit(1)
+        print(f"Backup does not exist yet. Creating initial backup from current state...")
+        print(f"Copying {WORKING_DIR} -> {BACKUP_DIR}...")
+        try:
+            shutil.copytree(WORKING_DIR, BACKUP_DIR)
+            print("Initial backup created successfully!")
+            print("NOTE: This backup will be used for all future restores.")
+            print("      To refresh the backup, delete it and run the script again.")
+            return  # Don't restore on first run, just create backup
+        except Exception as e:
+            print(f"ERROR: Failed to create backup: {e}")
+            sys.exit(1)
         
     print(f"Mirroring {BACKUP_DIR} -> {WORKING_DIR}...")
     cmd = ['robocopy', BACKUP_DIR, WORKING_DIR, '/MIR', '/NFL', '/NDL', '/NJH', '/NJS', '/NC', '/NS', '/NP']
@@ -91,16 +130,60 @@ def process_xml_content(content, faction_name, faction_pattern, file_path):
     """
     Parses top-level blocks via Regex (simulating XML traversal) and injects/updates tags.
     Also converts Neutral/Underworld units to the selected faction for skirmish mode.
-    Returns: (modified_content, list of converted units)
+    Returns: (modified_content, list of converted units, conversion_stats)
     """
-    file_matches_faction = False
-    if faction_name.lower() in file_path.lower():
-        file_matches_faction = True
+    # FILE-LEVEL EXCLUSION: Skip files with OTHER major faction keywords in name
+    # e.g., if faction_name="Republic", skip files with "_Rebel_", "_Empire_", "_CIS_"
+    # This prevents modifying Republic variants inside other faction files
+    other_factions = {
+        "Republic": ["Rebel", "Empire", "CIS", "Confederacy"],
+        "Empire": ["Rebel", "Republic", "CIS", "Confederacy"],
+        "Rebellion": ["Empire", "Republic", "CIS", "Confederacy"],  # Rebellion matches Rebel
+        "CIS": ["Rebel", "Empire", "Republic"]
+    }
     
-    if not file_matches_faction and faction_pattern != r".*":
-        if re.search(fr"<Affiliation>.*{faction_pattern}.*</Affiliation>", content, re.IGNORECASE | re.DOTALL):
-            file_matches_faction = True
-            
+    # EXCLUDED FILES: Critical system files that should NEVER be converted or modified
+    # Modifying these breaks the AI because they are base classes for ALL factions
+    EXCLUDED_FILES = [
+        "_Default_Base.xml",
+        "_Attrition.xml",
+        "BuildPads.xml",  # Critical: Fixes AI economy/defense construction
+        "Research_Facilities_Default.xml",  # Critical: Fixes AI tech progression
+        "Shipyards_Default.xml",  # Critical: Fixes AI ship production
+        "Units_Space_Neutral_Freighters.xml", # Preserves base freighter classes
+        "Units_Space_Neutral_CEC_YT.xml"      # Preserves base YT classes
+    ]
+
+    filename = os.path.basename(file_path)
+    if filename in EXCLUDED_FILES:
+        return content, [], {
+            'squadrons': 0,
+            'frigates': 0,
+            'capitals': 0,
+            'heroes': 0,
+            'research': 0,
+            'neutral_converted': 0,
+            'faction_modified': 0,
+            'units_with_cheats': []
+        }
+
+    if faction_name in other_factions:
+        for other_faction in other_factions[faction_name]:
+            # Check for faction keyword with separator (avoid matching "Old_Republic", "Old_Empire")
+            # Match patterns like "_Rebel_", "_Empire_", etc.
+            if re.search(fr'(?<!Old)[_\\]{other_faction}[_\\]', filename, re.IGNORECASE):
+                # This file belongs to another faction - skip entirely
+                return content, [], {
+                    'squadrons': 0,
+                    'frigates': 0,
+                    'capitals': 0,
+                    'heroes': 0,
+                    'research': 0,
+                    'neutral_converted': 0,
+                    'faction_modified': 0,
+                    'units_with_cheats': []
+                }
+    
     # CHEATS CONFIG: Time set to "1" to avoid game logic erors (infinity/disabled)
     # CHEATS CONFIG: Cost disabled, but Time/Limits enabled as requested
     CHEATS = {
@@ -118,6 +201,16 @@ def process_xml_content(content, faction_name, faction_pattern, file_path):
     block_pattern = re.compile(fr'(<({types})\b[^>]*>)(.*?)(</\2>)', re.DOTALL | re.IGNORECASE)
     
     converted_units = []  # Track converted units for shipyard injection
+    conversion_stats = {
+        'squadrons': 0,
+        'frigates': 0,
+        'capitals': 0,
+        'heroes': 0,
+        'research': 0,
+        'neutral_converted': 0,
+        'faction_modified': 0,
+        'units_with_cheats': []  # List of (unit_name, unit_type) that had cheats applied
+    }
     
     def modify_block(match):
         start_tag = match.group(1)
@@ -136,7 +229,7 @@ def process_xml_content(content, faction_name, faction_pattern, file_path):
         # Examples to CONVERT:
         #   - Units_Space_Neutral_Hapan_* (no main faction)
         #   - Units_Hero_Underworld_* (no main faction)
-        # Exclude Old_Republic, Old_Empire etc using negative lookbehind
+        # Exclude Old_Republic, Old_Empire etc using negative look behind
         # We ensure the separator (\ or _) is NOT preceded by "Old"
         faction_keywords = r'(?<!Old)(\\|_)(Republic|Empire|Rebel|CIS|Confederacy)(\\|_|\\.|_)'
         file_has_faction = bool(re.search(faction_keywords, file_path, re.IGNORECASE))
@@ -144,14 +237,79 @@ def process_xml_content(content, faction_name, faction_pattern, file_path):
         # Only convert truly neutral/underworld units (not faction-specific variants or files in faction directories)
         should_convert_neutral = is_neutral_or_underworld and not file_has_faction
         
+        # SPECIAL HANDLING FOR UPGRADEOBJECTS:
+        # UpgradeObjects don't have <Affiliation> tags - they're organized by directory
+        # Check if this is an UpgradeObject in a faction-specific directory
+        is_upgrade_object = tag_type.lower() == "upgradeobject"
+        upgrade_in_faction_dir = False
+        if is_upgrade_object:
+            # Check if file path contains faction-specific directory
+            # e.g., /Upgrades/Skirmish/Space/Republic/ or /Upgrades/GC/Republic/
+            if faction_name.lower() in file_path.lower():
+                upgrade_in_faction_dir = True
+        
+        # UNIVERSAL UNIT NAME SUFFIX FILTER: Skip units with OTHER faction suffixes
+        # This applies to ALL block types (units, buildings, structures, upgrades)
+        # Extract unit name
+        name_match = re.search(r'Name="([^"]+)"', start_tag, re.IGNORECASE)
+        unit_name = name_match.group(1) if name_match else None
+        
+        if unit_name:
+            # Map factions to their common suffixes/keywords
+            faction_keywords_map = {
+                "Republic": ["Republic", "Rep"],
+                "Empire": ["Empire", "E"],
+                "Rebellion": ["Rebel", "R"],
+                "CIS": ["CIS", "Confederacy"]
+            }
+            
+            # Get other faction keywords (not the selected one)
+            other_keywords = []
+            for fac, keywords in faction_keywords_map.items():
+                if fac != faction_name:
+                    other_keywords.extend(keywords)
+            
+            # Add additional faction/group keywords
+            other_keywords.extend(["U", "Underworld", "HC", "Cartels", "CSA", "Warlords", "Hapan", "Mand", "Mandalorian", "H", "S", "Sith", "Naboo"])
+            
+            # Check if this unit has an other-faction keyword ANYWHERE in the name
+            # Look for keywords as standalone segments (between underscores or at start/end)
+            has_other_faction_keyword = False
+            for keyword in other_keywords:
+                # Check for keyword as:
+                # - At start: "CIS_Something"
+                # - In middle: "Something_CIS_Something"  
+                # - At end: "Something_CIS"
+                patterns = [
+                    f"^{keyword}_",      # Starts with keyword_
+                    f"_{keyword}_",      # Contains _keyword_
+                    f"_{keyword}$"       # Ends with _keyword
+                ]
+                for pattern in patterns:
+                    if re.search(pattern, unit_name, re.IGNORECASE):
+                        has_other_faction_keyword = True
+                        break
+                if has_other_faction_keyword:
+                    break
+            
+            # Skip this unit - it belongs to another faction
+            if has_other_faction_keyword:
+                return match.group(0)
+        
+        # STRICT BLOCK-LEVEL MATCHING: Only modify this block if:
+        # 1. It's a neutral/underworld unit eligible for conversion, OR
+        # 2. This specific block has the selected faction's affiliation tag, OR
+        # 3. It's an UpgradeObject in the selected faction's directory
         block_matches = False
         if should_convert_neutral:
             # Convert truly Neutral/Underworld units to selected faction for skirmish mode
             block_matches = True
-        elif re.search(fr"<Affiliation>.*{faction_pattern}.*</Affiliation>", inner_content, re.IGNORECASE):
+        elif is_upgrade_object and upgrade_in_faction_dir:
+            # UpgradeObject in faction-specific directory - process it
             block_matches = True
-        elif file_matches_faction:
-             block_matches = True
+        elif re.search(fr"<Affiliation>.*{faction_pattern}.*</Affiliation>", inner_content, re.IGNORECASE):
+            # This block specifically has the selected faction - modify it
+            block_matches = True
         
         if not block_matches:
             return match.group(0)
@@ -160,9 +318,7 @@ def process_xml_content(content, faction_name, faction_pattern, file_path):
         
         # If this is a truly Neutral/Underworld unit and we have a specific faction selected, convert it
         if should_convert_neutral:
-            # Extract unit name for shipyard roster tracking
-            name_match = re.search(r'Name="([^"]+)"', start_tag, re.IGNORECASE)
-            unit_name = name_match.group(1) if name_match else None
+            conversion_stats['neutral_converted'] += 1
             
             # Extract CategoryMask to determine shipyard type
             category_match = re.search(r'<CategoryMask>([^<]+)</CategoryMask>', inner_content, re.IGNORECASE)
@@ -184,15 +340,21 @@ def process_xml_content(content, faction_name, faction_pattern, file_path):
                     if unit_type == "squadron":
                         # Squadron always goes to Starbase (all levels)
                         converted_units.append((unit_name, "squadron"))
+                        conversion_stats['squadrons'] += 1
                     else:
                         # SpaceUnit goes to Frigate or Capital Shipyard
                         # Heroes/Uniques go to Research Facility as requested by user
                         if unit_type in ["genericherounit", "herounit", "uniqueunit"]:
                              converted_units.append((unit_name, "research"))
+                             conversion_stats['heroes'] += 1
                         else:
                              # Fallback check for capital ships
                              is_capital = bool(re.search(r'Capital|Destroyer|Cruiser|Carrier|Battleship|Dreadnought', category_mask, re.IGNORECASE))
                              converted_units.append((unit_name, "capital" if is_capital else "frigate"))
+                             if is_capital:
+                                 conversion_stats['capitals'] += 1
+                             else:
+                                 conversion_stats['frigates'] += 1
             
             # Change affiliation to the selected faction
             affiliation_regex = re.compile(r'(<Affiliation>).*?(</Affiliation>)', re.IGNORECASE | re.DOTALL)
@@ -246,11 +408,21 @@ def process_xml_content(content, faction_name, faction_pattern, file_path):
             if re.search(r'<Build_Initially_Locked>', new_inner, re.IGNORECASE):
                 new_inner = re.sub(r'(<Build_Initially_Locked>).*?(</Build_Initially_Locked>)', r'\g<1>No\g<2>', new_inner, flags=re.IGNORECASE)
             else:
-                 new_inner += '\n\t\t<Build_Initially_Locked>No</Build_Initially_Locked>'
+                  new_inner += '\n\t\t<Build_Initially_Locked>No</Build_Initially_Locked>'
+        else:
+            # Not a neutral conversion, just a regular faction modification
+            conversion_stats['faction_modified'] += 1
         
         # Apply standard cheats to all matching units
         # Skip build limits for Research/Upgrades/UpgradeObject (they don't make sense for technologies)
         is_research_or_upgrade = bool(re.search(r'(Research|Upgrades)', file_path, re.IGNORECASE)) or tag_type.lower() == "upgradeobject"
+        
+        # Extract unit name for debug tracking
+        name_match = re.search(r'Name="([^"]+)"', start_tag, re.IGNORECASE)
+        unit_name = name_match.group(1) if name_match else "Unknown"
+        
+        # Track that this unit had cheats applied
+        conversion_stats['units_with_cheats'].append(unit_name)
         
         for tag, value in CHEATS.items():
             final_value = value
@@ -273,7 +445,7 @@ def process_xml_content(content, faction_name, faction_pattern, file_path):
         return f"{start_tag}{new_inner}{end_tag}"
 
     new_content = block_pattern.sub(modify_block, content)
-    return new_content, converted_units
+    return new_content, converted_units, conversion_stats
 
 def inject_units_into_shipyard_rosters(faction_name, converted_units):
     """
@@ -492,6 +664,17 @@ def apply_cheats(faction_name, faction_pattern):
     processed_count = 0
     all_converted_units = []  # Collect all converted units
     
+    # Debug tracking
+    total_stats = {
+        'squadrons': 0,
+        'frigates': 0,
+        'capitals': 0,
+        'heroes': 0,
+        'neutral_converted': 0,
+        'faction_modified': 0
+    }
+    files_with_conversions = []  # Track files that had neutral conversions
+    
     for rel_dir in target_dirs:
         abs_path = os.path.join(XML_DIR, rel_dir)
         if not os.path.exists(abs_path): continue
@@ -509,16 +692,124 @@ def apply_cheats(faction_name, faction_pattern):
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
                     
-                    new_content, converted_units = process_xml_content(content, faction_name, faction_pattern, file_path)
+                    new_content, converted_units, file_stats = process_xml_content(content, faction_name, faction_pattern, file_path)
                     all_converted_units.extend(converted_units)  # Collect converted units
                     
                     if new_content != content:
                         with open(file_path, 'w', encoding='utf-8') as f: f.write(new_content)
                         processed_count += 1
+                        
+                        # Track stats for debug output
+                        for key in total_stats:
+                            if key in file_stats:  # Skip units_with_cheats list
+                                total_stats[key] += file_stats[key]
+                        
+                        # Track ALL modified files for debug (not just neutral conversions)
+                        rel_path = os.path.relpath(file_path, XML_DIR)
+                        files_with_conversions.append({
+                            'file': rel_path,
+                            'stats': file_stats.copy()
+                        })
                 except Exception as e:
                     print(f"Skipping {file}: {e}")
 
     print(f"Modified {processed_count} files for {faction_name}.")
+    
+    # Display detailed debug info if enabled
+    if DEBUG and files_with_conversions:
+        print("\n" + "="*80)
+        print(" DEBUG: DETAILED FILE MODIFICATION REPORT")
+        print("="*80)
+        
+        # Separate files into categories
+        neutral_files = []
+        faction_files = []
+        
+        for item in files_with_conversions:
+            if item['stats']['neutral_converted'] > 0:
+                neutral_files.append(item)
+            else:
+                faction_files.append(item)
+        
+        # Show Neutral/Underworld conversions first
+        if neutral_files:
+            print("\n" + "-"*80)
+            print(" NEUTRAL/UNDERWORLD UNIT CONVERSIONS:")
+            print("-"*80)
+            for item in neutral_files:
+                file_name = item['file']
+                stats = item['stats']
+                
+                parts = []
+                if stats['neutral_converted'] > 0:
+                    parts.append(f"{stats['neutral_converted']} neutral converted")
+                if stats['squadrons'] > 0:
+                    parts.append(f"{stats['squadrons']} squadron(s)")
+                if stats['frigates'] > 0:
+                    parts.append(f"{stats['frigates']} frigate(s)")
+                if stats['capitals'] > 0:
+                    parts.append(f"{stats['capitals']} capital(s)")
+                if stats['heroes'] > 0:
+                    parts.append(f"{stats['heroes']} hero(es)")
+                
+                detail = ", ".join(parts) if parts else "modified"
+                print(f"\n  File: {file_name}")
+                print(f"    Type: {detail}")
+                
+                # Show units that had cheats applied
+                if stats['units_with_cheats']:
+                    print(f"    Units modified (time/pop/limits): {len(stats['units_with_cheats'])} units")
+                    if len(stats['units_with_cheats']) <= 10:  # Show unit names if not too many
+                        for unit in stats['units_with_cheats']:
+                            print(f"      - {unit}")
+                    else:
+                        # Show first 5 and last 5
+                        for unit in stats['units_with_cheats'][:5]:
+                            print(f"      - {unit}")
+                        print(f"      ... ({len(stats['units_with_cheats']) - 10} more) ...")
+                        for unit in stats['units_with_cheats'][-5:]:
+                            print(f"      - {unit}")
+        
+        # Show regular faction modifications
+        if faction_files:
+            print("\n" + "-"*80)
+            print(" FACTION UNIT MODIFICATIONS (Build Time/Pop/Limits):")
+            print("-"*80)
+            for item in faction_files:
+                file_name = item['file']
+                stats = item['stats']
+                
+                print(f"\n  File: {file_name}")
+                print(f"    Faction units modified: {stats['faction_modified']}")
+                
+                # Show units that had cheats applied
+                if stats['units_with_cheats']:
+                    print(f"    Units modified (time/pop/limits): {len(stats['units_with_cheats'])} units")
+                    if len(stats['units_with_cheats']) <= 10:  # Show unit names if not too many
+                        for unit in stats['units_with_cheats']:
+                            print(f"      - {unit}")
+                    else:
+                        # Show first 5 and last 5
+                        for unit in stats['units_with_cheats'][:5]:
+                            print(f"      - {unit}")
+                        print(f"      ... ({len(stats['units_with_cheats']) - 10} more) ...")
+                        for unit in stats['units_with_cheats'][-5:]:
+                            print(f"      - {unit}")
+        
+        # Overall summary
+        print("\n" + "="*80)
+        print(" TOTAL SUMMARY:")
+        print("="*80)
+        print(f"  Total files modified: {processed_count}")
+        print(f"  Files with neutral conversions: {len(neutral_files)}")
+        print(f"  Files with faction modifications: {len(faction_files)}")
+        print(f"\n  Neutral units converted: {total_stats['neutral_converted']}")
+        print(f"    - Squadrons: {total_stats['squadrons']}")
+        print(f"    - Frigates: {total_stats['frigates']}")
+        print(f"    - Capitals: {total_stats['capitals']}")
+        print(f"    - Heroes/Research: {total_stats['heroes']}")
+        print(f"\n  Faction units modified: {total_stats['faction_modified']}")
+        print("="*80)
     
     # Inject converted units into shipyard rosters if any were found
     if all_converted_units:
